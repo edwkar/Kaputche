@@ -5,9 +5,9 @@ import Control.Applicative ((<$>), (<*>))
 import Control.Concurrent (forkIO)
 import Control.Exception (catch, IOException, evaluate)
 import Control.Monad (liftM, forM_, forever, void, when, unless)
+import Control.Monad.Error (ErrorT, runErrorT, throwError, catchError)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Reader (ReaderT, runReaderT, ask)
-import Control.Monad.Error (ErrorT, runErrorT, throwError, catchError)
 import Data.List (isInfixOf, sort)
 import System.Exit (exitWith, ExitCode(..))
 import System.IO (Handle, hPutStr, hPutStrLn, hGetChar, hPutChar, hClose,
@@ -29,6 +29,7 @@ main = do
         putStrLn $ "Serving from directory '" ++ dir ++ "'..."
 
     N.withSocketsDo $ runReaderT runServer conf
+
   where
     conf = ServerConfig (N.PortNumber 22880)
 
@@ -39,6 +40,7 @@ runServer = do
     s <- lDoOrDie (N.listenOn $ serverPortId conf)
                  "Couldn't bind listening socket"
     forever $ acceptClient s
+
   where
     acceptClient s = do
         (h, cHost, p) <- lDoOrDie (N.accept s) "Failed to accept client"
@@ -49,19 +51,19 @@ runServer = do
 
 handleClient :: Handle -> App ()
 handleClient h = liftIO $ void $ forkIO $ do
-    reqRaw <- lines <$> hGetContents h
-    res <- runErrorT (processRequest reqRaw)
+    reqRaw <- RawRequest <$> lines <$> hGetContents h
+    res <- runErrorT $ processRequest reqRaw
     case res of
         Right r -> sendResponse h r
         Left e  -> sendResponse h $ HttpResponse httpBadRequest e
     hClose h
 
 
-processRequest :: [String] -> ErrorT String IO HttpResponse
-processRequest reqRaw = do
-    unless (canParseUri reqRaw) $ throwError "Bad Request"
+processRequest :: RawRequest -> ErrorT String IO HttpResponse
+processRequest rr@(RawRequest xs) = do
+    unless (canParseUri rr) $ throwError "Bad Request"
 
-    let method:_pathRaw:_ = words $ head reqRaw
+    let method:_pathRaw:_ = words $ head xs
     let pathRaw = "./" ++ _pathRaw
 
     unless (method == "GET") $ throwError "Unrecognized Method"
@@ -90,21 +92,24 @@ newFileResponse :: FilePath -> IO HttpResponse
 newFileResponse path =
     withFile path ReadMode $ \h -> do
         data_ <- hGetContents h
-        evaluate (length data_) -- Argh...
+        evaluate $ length data_ -- Argh...
         return $ HttpResponse httpOk data_
 
 
 sendResponse :: Handle -> HttpResponse -> IO ()
 sendResponse h (HttpResponse statusCode body) = do
     hPutStrLn h $ "HTTP/1.0 " ++ show statusCode
-    when ("<html>" `isInfixOf` body)
-         (hPutStrLn h "Content-Type: text/html; charset=UTF-8")
+    when ("<html>" `isInfixOf` body) $
+         hPutStrLn h "Content-Type: text/html; charset=UTF-8"
     hPutStrLn h ""
     hPutStrLn h body
 
 
-canParseUri :: [String] -> Bool
-canParseUri xs = xs /= [] && length (words $ head xs) >= 2
+canParseUri :: RawRequest -> Bool
+canParseUri (RawRequest xs) = xs /= [] && length (words $ head xs) >= 2
+
+
+data HttpResponse = HttpResponse HttpStatusCode String deriving (Show)
 
 
 data HttpStatusCode  = HttpStatusCode Int String
@@ -116,10 +121,15 @@ httpForbidden        = HttpStatusCode 403 "Forbidden"
 httpNotFound         = HttpStatusCode 404 "Not found"
 httpMethodNotAllowed = HttpStatusCode 405 "Method Not Allowed"
 
-data HttpResponse = HttpResponse HttpStatusCode String deriving (Show)
+
+newtype RawRequest = RawRequest [String]
+
 
 data ServerConfig = ServerConfig { serverPortId :: N.PortID }
 
+
+-- --------------------------------------------------------------------
+-- --------------------------------------------------------------------
 
 doOrDie :: IO a -> String -> IO a
 doOrDie action explPrefix =
